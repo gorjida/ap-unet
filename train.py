@@ -15,11 +15,9 @@ from unet import UNet
 from torch.utils.tensorboard import SummaryWriter
 from utils.dataset import BasicDataset
 from torch.utils.data import DataLoader, random_split
-from torch.utils.data import DataLoader
-import time
 
-dir_img = 'data/imgs/'
-dir_mask = 'data/masks/'
+dir_img = 'data/imgs_small/'
+dir_mask = 'data/masks_small/'
 dir_checkpoint = 'checkpoints/'
 
 
@@ -30,8 +28,7 @@ def train_net(net,
               lr=0.001,
               val_percent=0.1,
               save_cp=True,
-              img_scale=0.5,
-              file_writer=None):
+              img_scale=0.5):
 
     dataset = BasicDataset(dir_img, dir_mask, img_scale)
     n_val = int(len(dataset) * val_percent)
@@ -61,7 +58,6 @@ def train_net(net,
     else:
         criterion = nn.BCEWithLogitsLoss()
 
-    prevTime = time.time()
     for epoch in range(epochs):
         net.train()
 
@@ -81,7 +77,6 @@ def train_net(net,
 
                 masks_pred = net(imgs)
                 loss = criterion(masks_pred, true_masks)
-
                 epoch_loss += loss.item()
                 writer.add_scalar('Loss/train', loss.item(), global_step)
 
@@ -95,16 +90,11 @@ def train_net(net,
                 pbar.update(imgs.shape[0])
                 global_step += 1
                 if global_step % (len(dataset) // (10 * batch_size)) == 0:
-                    currentTime = time.time()
-                    lossTime = (currentTime-prevTime)
-                    prevTime = currentTime
                     for tag, value in net.named_parameters():
                         tag = tag.replace('.', '/')
                         writer.add_histogram('weights/' + tag, value.data.cpu().numpy(), global_step)
                         writer.add_histogram('grads/' + tag, value.grad.data.cpu().numpy(), global_step)
                     val_score = eval_net(net, val_loader, device)
-                    stringToWrite = [str(epoch),str(global_step),str(epoch_loss/global_step),str(val_score)]
-                    file_writer.write("\t".join(stringToWrite)+"\n")
                     scheduler.step(val_score)
                     writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], global_step)
 
@@ -136,9 +126,9 @@ def train_net(net,
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('-e', '--epochs', metavar='E', type=int, default=1,
+    parser.add_argument('-e', '--epochs', metavar='E', type=int, default=5,
                         help='Number of epochs', dest='epochs')
-    parser.add_argument('-b', '--batch-size', metavar='B', type=int, nargs='?', default=2,
+    parser.add_argument('-b', '--batch-size', metavar='B', type=int, nargs='?', default=1,
                         help='Batch size', dest='batchsize')
     parser.add_argument('-l', '--learning-rate', metavar='LR', type=float, nargs='?', default=0.1,
                         help='Learning rate', dest='lr')
@@ -153,7 +143,6 @@ def get_args():
 
 
 if __name__ == '__main__':
-    writer = open("eval_loss_results.txt","w")
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     args = get_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -188,8 +177,7 @@ if __name__ == '__main__':
                   lr=args.lr,
                   device=device,
                   img_scale=args.scale,
-                  val_percent=args.val / 100,
-                  file_writer=writer)
+                  val_percent=args.val / 100)
     except KeyboardInterrupt:
         torch.save(net.state_dict(), 'INTERRUPTED.pth')
         logging.info('Saved interrupt')
@@ -197,4 +185,3 @@ if __name__ == '__main__':
             sys.exit(0)
         except SystemExit:
             os._exit(0)
-    writer.close()

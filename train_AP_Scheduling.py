@@ -9,18 +9,20 @@ import torch.nn as nn
 from torch import optim
 from tqdm import tqdm
 
-from eval import eval_net
-from unet import UNet
+from eval import eval_net_AP_Power
+from unet.unet_model_AP_Scheduling import UNet
 
 from torch.utils.tensorboard import SummaryWriter
 from utils.dataset import BasicDataset
+from utils.data_reader import DataReader
 from torch.utils.data import DataLoader, random_split
-from torch.utils.data import DataLoader
-import time
 
-dir_img = 'data/imgs/'
-dir_mask = 'data/masks/'
+dir_img = 'data/imgs_small/'
+dir_mask = 'data/masks_small/'
 dir_checkpoint = 'checkpoints/'
+mainFolder = "/home/ali/SharedFolder/detector_test/unetOptimization" \
+                 "/measurement_campaign_20200430/data/"
+rawPath = mainFolder + "res_UL_HP10m-K20-M100-sh0_Opt(IEQpower-lmda0.0,maxMinSNR,UL-bisec-Power(lp)-IPAP(iib)-isRoun0,sci-int,sci-int,1200-60-0,InitAssMat-sta-200).pkl"
 
 
 def train_net(net,
@@ -31,14 +33,19 @@ def train_net(net,
               val_percent=0.1,
               save_cp=True,
               img_scale=0.5,
-              file_writer=None):
-
-    dataset = BasicDataset(dir_img, dir_mask, img_scale)
+              mode=0,
+              alpha=.5):
+    #mode=0 ==> AP-scheduling only
+    #mode=1 ==> power allocation only
+    #mode=2 ==> joint AP-scheduling and power allocation
+    dataset = DataReader(rawPath,mode)
     n_val = int(len(dataset) * val_percent)
     n_train = len(dataset) - n_val
     train, val = random_split(dataset, [n_train, n_val])
     train_loader = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
     val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True, drop_last=True)
+    print("Number of training instances="+str(n_train))
+    print("Number of validation instances="+str(n_val))
 
     writer = SummaryWriter(comment=f'LR_{lr}_BS_{batch_size}_SCALE_{img_scale}')
     global_step = 0
@@ -54,14 +61,15 @@ def train_net(net,
         Images scaling:  {img_scale}
     ''')
 
+    #Define optimizer and scheduler
     optimizer = optim.RMSprop(net.parameters(), lr=lr, weight_decay=1e-8, momentum=0.9)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min' if net.n_classes > 1 else 'max', patience=2)
-    if net.n_classes > 1:
-        criterion = nn.CrossEntropyLoss()
-    else:
-        criterion = nn.BCEWithLogitsLoss()
 
-    prevTime = time.time()
+    criterionAP = nn.BCEWithLogitsLoss()
+    criterionPower = nn.MSELoss()
+
+
+    #Main loop over epochs
     for epoch in range(epochs):
         net.train()
 
@@ -70,6 +78,7 @@ def train_net(net,
             for batch in train_loader:
                 imgs = batch['image']
                 true_masks = batch['mask']
+                true_powers = batch['power']
                 assert imgs.shape[1] == net.n_channels, \
                     f'Network has been defined with {net.n_channels} input channels, ' \
                     f'but loaded images have {imgs.shape[1]} channels. Please check that ' \
@@ -77,10 +86,22 @@ def train_net(net,
 
                 imgs = imgs.to(device=device, dtype=torch.float32)
                 mask_type = torch.float32 if net.n_classes == 1 else torch.long
+                power_type = torch.long
                 true_masks = true_masks.to(device=device, dtype=mask_type)
+                true_powers = true_powers.to(device=device, dtype=power_type)
 
                 masks_pred = net(imgs)
-                loss = criterion(masks_pred, true_masks)
+
+                if "AP" in masks_pred:
+                    lossAP = criterionAP(masks_pred["AP"],true_masks)
+                if "Power" in masks_pred:
+                    lossPower = criterionPower(masks_pred["Power"],true_powers)
+                if mode==0:
+                    loss = lossAP
+                elif mode==1:
+                    loss = lossPower
+                else:
+                    loss = alpha*lossAP+ (1-alpha)*lossPower
 
                 epoch_loss += loss.item()
                 writer.add_scalar('Loss/train', loss.item(), global_step)
@@ -95,16 +116,18 @@ def train_net(net,
                 pbar.update(imgs.shape[0])
                 global_step += 1
                 if global_step % (len(dataset) // (10 * batch_size)) == 0:
-                    currentTime = time.time()
-                    lossTime = (currentTime-prevTime)
-                    prevTime = currentTime
                     for tag, value in net.named_parameters():
                         tag = tag.replace('.', '/')
                         writer.add_histogram('weights/' + tag, value.data.cpu().numpy(), global_step)
                         writer.add_histogram('grads/' + tag, value.grad.data.cpu().numpy(), global_step)
-                    val_score = eval_net(net, val_loader, device)
-                    stringToWrite = [str(epoch),str(global_step),str(epoch_loss/global_step),str(val_score)]
-                    file_writer.write("\t".join(stringToWrite)+"\n")
+                    val_score_AP, val_score_Power = eval_net_AP_Power(net,
+                                                val_loader, device)
+                    if mode==0:
+                        val_score = val_score_AP
+                    elif mode==1:
+                        val_score = val_score_Power
+                    else:
+                        val_score = alpha*val_score_AP + (1-alpha)*val_score_Power
                     scheduler.step(val_score)
                     writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], global_step)
 
@@ -136,9 +159,9 @@ def train_net(net,
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('-e', '--epochs', metavar='E', type=int, default=1,
+    parser.add_argument('-e', '--epochs', metavar='E', type=int, default=5,
                         help='Number of epochs', dest='epochs')
-    parser.add_argument('-b', '--batch-size', metavar='B', type=int, nargs='?', default=2,
+    parser.add_argument('-b', '--batch-size', metavar='B', type=int, nargs='?', default=1,
                         help='Batch size', dest='batchsize')
     parser.add_argument('-l', '--learning-rate', metavar='LR', type=float, nargs='?', default=0.1,
                         help='Learning rate', dest='lr')
@@ -153,11 +176,15 @@ def get_args():
 
 
 if __name__ == '__main__':
-    writer = open("eval_loss_results.txt","w")
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     args = get_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
+    mode = 0
+    if mode==0 or mode==1:
+        n_channels = 2
+    else:
+        n_channels = 1
 
     # Change here to adapt to your data
     # n_channels=3 for RGB images
@@ -165,7 +192,8 @@ if __name__ == '__main__':
     #   - For 1 class and background, use n_classes=1
     #   - For 2 classes, use n_classes=1
     #   - For N > 2 classes, use n_classes=N
-    net = UNet(n_channels=3, n_classes=1, bilinear=True)
+    net = UNet(n_channels=n_channels, n_classes=1, bilinear=True,mode=mode,
+               inputImageDim=[128,32],n_output=32)
     logging.info(f'Network:\n'
                  f'\t{net.n_channels} input channels\n'
                  f'\t{net.n_classes} output channels (classes)\n'
@@ -189,7 +217,8 @@ if __name__ == '__main__':
                   device=device,
                   img_scale=args.scale,
                   val_percent=args.val / 100,
-                  file_writer=writer)
+                  mode=mode,
+                  alpha=.5)
     except KeyboardInterrupt:
         torch.save(net.state_dict(), 'INTERRUPTED.pth')
         logging.info('Saved interrupt')
@@ -197,4 +226,3 @@ if __name__ == '__main__':
             sys.exit(0)
         except SystemExit:
             os._exit(0)
-    writer.close()
